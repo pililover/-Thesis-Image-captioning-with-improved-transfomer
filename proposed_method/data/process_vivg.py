@@ -5,6 +5,9 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 
 def process_vivg_graph(item):
+    """
+    Chuyển đổi 1 item JSON từ ViVG-10K thành đối tượng Graph (nút, cạnh, Super Node)
+    """
     global_scene_graph = item.get('global_scene_graph', {})
     nodes = global_scene_graph.get('nodes', [])
     relationships = global_scene_graph.get('relationships', [])
@@ -17,7 +20,7 @@ def process_vivg_graph(item):
     # dividing by 1000 keeps most values in [0, 1] without needing actual image dims.
     _REF = 1000.0
     
-    # Merge canonical + attributes
+    # Concatenate canonical + attributes (e.g., "large white polar bear") to create node text input for GNN
     for idx, node in enumerate(nodes):
         node_id_to_idx[node['node_id']] = idx
         canonical = node.get('canonical', '')
@@ -38,8 +41,8 @@ def process_vivg_graph(item):
         
     num_nodes = len(node_texts)
     
-    # Step 2: Adjacency Matrix
-    # only keep original nodes so Decoder can map each node individually
+    # Adjacency Matrix
+    # only keep original nodes so the Decoder can map each node separately
     edge_list = []
     for rel in relationships:
         sub_id = rel.get('sub')
@@ -58,7 +61,6 @@ def process_vivg_graph(item):
     node_bboxes_tensor = torch.tensor(node_bboxes, dtype=torch.float32) if node_bboxes \
         else torch.zeros(num_nodes, 4)
 
-    # e.g., "region_483581": {...})
     regions = item.get('regions_mapping', {})
     if isinstance(regions, dict) and len(regions) > 0:
         first_region = list(regions.values())[0]
@@ -76,6 +78,7 @@ def process_vivg_graph(item):
         "node_bboxes": node_bboxes_tensor,
         "edge_index": edge_index,
         "num_nodes": num_nodes,
+        "node_id_to_idx": node_id_to_idx,  
         "caption_vi": caption_vi,
         "caption_en": caption_en
     }

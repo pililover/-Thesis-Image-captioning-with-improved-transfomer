@@ -5,7 +5,6 @@ import argparse
 import sys
 import os
 
-# Add current directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.model import Siglip2MBartCaptioner
@@ -87,9 +86,15 @@ def run_training(args):
     Args:
         args: argparse.Namespace object with all required arguments
     """
-    # ─── DISK SPACE MANAGEMENT ───────────────────────────────────────────
+    # Turn off warnings for cleaner output (especially from transformers about max_length vs max_new_tokens)
+    import warnings
+    import logging
+    warnings.filterwarnings('ignore', message='.*Both `max_new_tokens`.*')
+    # logging.getLogger("transformers").setLevel(logging.ERROR)
+    
+    # DISK SPACE MANAGEMENT 
     # Colab /content local disk is ~100GB. With checkpoint overhead, fills up fast.
-    # Solution 1: Clear HuggingFace cache to free ~2-3GB
+    # Clear HuggingFace cache to free ~2-3GB
     if getattr(args, 'clear_cache', True):
         import shutil
         cache_dirs = [
@@ -113,12 +118,12 @@ def run_training(args):
         use_mbart_encoder=False,  # Image captioning (skip source text encoder)
         num_gat_layers=args.num_gat_layers,
         num_heads=args.num_heads,
-        # Giải pháp 2: Decoder capacity
+        # Decoder capacity
         freeze_mbart_decoder=getattr(args, 'freeze_decoder', False),
         use_lora=getattr(args, 'use_lora', False),
         lora_r=getattr(args, 'lora_r', 8),
         lora_alpha=getattr(args, 'lora_alpha', 16),
-        # Giải pháp 3: Regularization
+        # Regularization
         gat_dropout=getattr(args, 'dropout', 0.2),
         label_smoothing=getattr(args, 'label_smoothing', 0.1),
     )
@@ -145,14 +150,14 @@ def run_training(args):
         )
     print(f"Loading Datasets for language: {args.lang} | mBART lang_code: '{lang_code}' | forced_bos_token_id: {forced_bos_token_id}")
 
-    # ── FIX: Lock target language into generation_config ONLY (new transformers API) ──
+    # Lock target language into generation_config ONLY (new transformers API) 
     # model.config must NOT have generation params — set them on generation_config instead.
     # Without this, Trainer calls generate() with no forced_bos_token_id → decoder outputs garbage.
     if not hasattr(model, "generation_config"):
         from transformers import GenerationConfig
         model.generation_config = GenerationConfig()
     # mBART-50 standard: decoder_start_token_id = eos_token_id (=2, i.e. </s>)
-    # The language token is controlled ONLY via forced_bos_token_id.
+    # The language token is controlled only via forced_bos_token_id.
     # Setting decoder_start_token_id = lang_id breaks the decoder startup sequence
     # (training always starts decoder with </s> via shift_tokens_right).
     model.generation_config.forced_bos_token_id = forced_bos_token_id
@@ -163,9 +168,9 @@ def run_training(args):
     model.generation_config.no_repeat_ngram_size = 3
     model.generation_config.length_penalty = 1.0
     model.generation_config.num_beams = getattr(args, 'num_beams_eval', 1)
-    # max_new_tokens=30: captions are 5-15 words — 128 caused infinite hallucination
-    # after correct keywords (model kept generating until hitting the cap)
+    # Use max_new_tokens and clear max_length to avoid "both set" warning
     model.generation_config.max_new_tokens = 30
+    model.generation_config.max_length = None
     print(f"Locked generation_config: forced_bos_token_id={forced_bos_token_id} ({lang_code}), "
           f"eos_token_id={mbart_tok.eos_token_id}, decoder_start_token_id={mbart_tok.eos_token_id} (eos)")
 
@@ -187,34 +192,43 @@ def run_training(args):
     
     data_collator = ViVGCollate(pad_token_id=siglip_proc.tokenizer.pad_token_id)
     
-    # ── Overfit sanity-check mode: slice to first N samples ──────────────────
+    # Overfit sanity-check mode: randomly sample N images (all their regions)
     overfit_n = getattr(args, 'overfit_n', None)
     if overfit_n:
-        from torch.utils.data import Subset
-        train_dataset = Subset(train_dataset, range(min(overfit_n, len(train_dataset))))
-        # FIX: eval = SAME samples as train — sanity check verifies the model CAN memorize,
-        # not whether it generalizes. Using different val samples gives BLEU=0 trivially.
-        eval_dataset  = train_dataset
-        print(f"[Overfit mode] train={len(train_dataset)} samples | eval = SAME train samples")
+        import json as _json, random as _random
+        with open(os.path.join(args.data_dir, "train.json"), "r", encoding="utf-8") as _f:
+            _all_train = _json.load(_f)
+        _random.seed(42)
+        _sampled = _random.sample(_all_train, min(overfit_n, len(_all_train)))
+        train_dataset = ViVGDataset(
+            json_path=os.path.join(args.data_dir, "train.json"),
+            siglip_processor=siglip_proc,
+            mbart_tokenizer=mbart_tok,
+            image_dir=image_dir,
+            lang=args.lang,
+            preloaded_data=_sampled,
+        )
+        eval_dataset = train_dataset
+        print(f"[Overfit mode] {overfit_n} random images (seed=42) → {len(train_dataset)} region-samples | eval = SAME")
     
-    # ===== GIẢI PHÁP 1: Compute BLEU-4 trên Validation set =====
+    # Compute BLEU-4 of Validation set 
     def compute_metrics(eval_pred):
-        """Tính BLEU-4 thực tế từ predictions sinh ra qua Beam Search."""
+        """Compute actual BLEU-4 from predictions generated via Beam Search."""
         predictions, labels = eval_pred
         # predictions: [N, seq_len] numpy int array (generated token ids)
         # labels: [N, seq_len] numpy int array (ground truth, -100 for padding)
         
         # Khi Trainer gom predictions từ nhiều batch có độ dài khác nhau,
-        # các vị trí pad được điền bằng -100. Tokenizer Rust backend (MBart50TokenizerFast)
-        # cố chuyển -100 thành u32 → OverflowError. Phải thay thế trước khi decode.
+        # When Trainer gathers predictions from multiple batches of varying lengths, it pads them to -100. 
+        # Tokenizer Rust backend (MBart50TokenizerFast)
         predictions = np.where(predictions >= 0, predictions, mbart_tok.pad_token_id)
         decoded_preds = mbart_tok.batch_decode(predictions, skip_special_tokens=True)
         
-        # Thay thế -100 bằng pad_token_id trước khi decode
+        # Change labels from -100 to pad_token_id for decoding
         labels_for_decode = np.where(labels != -100, labels, mbart_tok.pad_token_id)
         decoded_labels = mbart_tok.batch_decode(labels_for_decode, skip_special_tokens=True)
         
-        # Tính BLEU-4 (ưu tiên sacrebleu, fallback sang nltk)
+        # Compute BLEU-4 (prefer sacrebleu, fallback to nltk)
         try:
             from sacrebleu.metrics import BLEU
             bleu = BLEU(max_ngram_order=4)
@@ -225,7 +239,7 @@ def run_training(args):
             hyps = [pred.split() for pred in decoded_preds]
             bleu_score = corpus_bleu(refs, hyps, smoothing_function=SmoothingFunction().method1) * 100
         
-        # --- DEBUG: uncomment to print sample predictions during eval (useful for sanity check)
+        # --- DEBUG: uncomment to print sample predictions during eval (for sanity check)
         # import random as _random
         # n_show = min(5, len(decoded_preds))
         # show_indices = _random.sample(range(len(decoded_preds)), n_show)
@@ -246,7 +260,7 @@ def run_training(args):
         warmup_steps=args.warmup_steps,
         max_grad_norm=args.max_grad_norm,
         
-        # Giải pháp 3: Regularization
+        # Regularization
         weight_decay=getattr(args, 'weight_decay', 0.01),
         
         remove_unused_columns=False,
@@ -256,6 +270,7 @@ def run_training(args):
         # For mBART-50 (~2.6GB), checkpoint overhead is huge. Set to 1-2 to save space.
         save_strategy=getattr(args, 'save_strategy', 'epoch'),
         save_total_limit=getattr(args, 'save_total_limit', 2),
+        # CustomTrainer._save() overrides to use torch.save() (not safetensors) for all checkpoints
         
         # Hugging Face Hub Integration
         push_to_hub=getattr(args, 'push_to_hub', False) and bool(getattr(args, 'hf_repo_id', None)),
@@ -268,22 +283,39 @@ def run_training(args):
         dataloader_num_workers=getattr(args, 'dataloader_num_workers', 4),
         dataloader_pin_memory=getattr(args, 'pin_memory', False),
         
-        # Giải pháp 1: Đánh giá bằng BLEU-4 (không phải eval_loss)
+        # Compute BLEU-4 (not eval_loss)
         eval_strategy=args.eval_strategy,
         logging_dir="./logs",
         logging_steps=getattr(args, 'logging_steps', 10),
         load_best_model_at_end=True,
-        metric_for_best_model="bleu4",   # <-- BLEU-4 thay vì eval_loss
-        greater_is_better=True,           # <-- BLEU càng cao càng tốt
-        label_names=["labels"],           # <-- ensures Trainer knows which key is the label
+        metric_for_best_model="bleu4",
+        greater_is_better=True,
+        label_names=["labels"],
     )
     
     # Custom Trainer class to handle our model's specific inputs
     class CustomTrainer(Trainer):
-        # predict_with_generate=True: prediction_step sẽ dùng model.generate() (Beam Search)
-        # thay vì teacher forcing để tính BLEU-4 thực tế trên Validation set.
-        # (Tương đương flag predict_with_generate của Seq2SeqTrainer)
+        # predict_with_generate=True: prediction_step will use model.generate() (Beam Search)
+        # instead of teacher forcing to compute actual BLEU-4 on the Validation set.
+        # (Equivalent to the predict_with_generate flag of Seq2SeqTrainer)
         predict_with_generate: bool = True
+
+        def _save(self, output_dir=None, state_dict=None):
+            """
+            Override to force torch.save (not safetensors) for all checkpoints.
+            mBART-50 ties embed_tokens / lm_head / shared to the SAME tensor — safetensors
+            raises RuntimeError on shared-memory tensors, even when save_safetensors=False
+            is set in TrainingArguments (some transformers versions ignore it for PEFT models).
+            """
+            if output_dir is None:
+                output_dir = self.args.output_dir
+            os.makedirs(output_dir, exist_ok=True)
+            if state_dict is None:
+                state_dict = self.model.state_dict()
+            torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+            # Persist config so from_pretrained can reload the checkpoint later
+            if hasattr(self.model, "config"):
+                self.model.config.save_pretrained(output_dir)
 
         def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
             # Extract labels (will be used for loss computation in model)
@@ -296,6 +328,8 @@ def run_training(args):
                 node_bboxes=inputs.get("node_bboxes", None),
                 edge_index=inputs.get("edge_index"),
                 batch=inputs.get("batch", None),
+                region_bbox=inputs.get("region_bbox", None),
+                region_node_mask=inputs.get("region_node_mask", None),
                 labels=labels
             )
             
@@ -304,33 +338,34 @@ def run_training(args):
         
         def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
             """
-            Override prediction_step để chạy Beam Search thực tế thay vì teacher forcing.
-            Giải pháp 1: Đây là nơi BLEU-4 được tính - dùng model.generate() với num_beams=4.
+            Override prediction_step to run actual Beam Search instead of teacher forcing.
+            This is where BLEU-4 is computed - use model.generate() with num_beams=4.
             """
             inputs = self._prepare_inputs(inputs)
             labels = inputs.get("labels")
             
             with torch.no_grad():
-                # Luôn tính loss (để log eval_loss song song với BLEU-4)
+                # Always compute loss (to log eval_loss alongside BLEU-4)
                 loss, _ = self.compute_loss(model, dict(inputs), return_outputs=True)
                 
                 if prediction_loss_only or not self.predict_with_generate:
                     return loss.detach(), None, None
                 
-                # predict_with_generate=True: Sinh câu thực tế qua Beam Search
-                # forced_bos_token_id bắt buộc để mBART-50 sinh đúng ngôn ngữ đích
+                # predict_with_generate=True: Generate actual sentences via Beam Search
+                # forced_bos_token_id is required for mBART-50 to generate in the correct target language
                 generated_tokens = model.generate(
                     pixel_values=inputs.get("pixel_values"),
                     node_input_ids=inputs.get("node_input_ids"),
                     node_bboxes=inputs.get("node_bboxes", None),
                     edge_index=inputs.get("edge_index"),
                     batch=inputs.get("batch"),
+                    region_bbox=inputs.get("region_bbox", None),
+                    region_node_mask=inputs.get("region_node_mask", None),
                     # max_new_tokens=30: captions are 5-15 words — 128 caused hallucination
                     # after correct keywords (model kept running until hitting the cap)
                     max_new_tokens=30,
                     num_beams=getattr(args, 'num_beams_eval', 1),
                     do_sample=False,                           # greedy/beam — deterministic for eval
-                    early_stopping=True,
                     forced_bos_token_id=forced_bos_token_id,
                     eos_token_id=mbart_tok.eos_token_id,      # explicitly tell generate() to stop at </s>
                     repetition_penalty=getattr(args, 'repetition_penalty', 1.2),
@@ -341,7 +376,7 @@ def run_training(args):
             return loss.detach(), generated_tokens, labels
     
     # Initialize Custom Trainer
-    # DISK FIX: Add aggressive cache cleanup callback after each epoch
+    # Add aggressive cache cleanup callback after each epoch
     class CacheCleanupCallback(TrainerCallback):
         """Clean up HuggingFace cache and GPU memory after each epoch to prevent disk quota overflow."""
         def on_epoch_end(self, args, state, control, **kwargs):
@@ -365,7 +400,7 @@ def run_training(args):
         compute_metrics=compute_metrics,   # <-- BLEU-4 metrics
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-            CacheCleanupCallback()  # DISK FIX: cleanup after every epoch
+            CacheCleanupCallback()
         ]
     )
     

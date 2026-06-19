@@ -7,7 +7,7 @@ class CrossAttentionFusionLayer(nn.Module):
     def __init__(self, d_model=1024, nhead=8, use_gate=True):
         super().__init__()
         self.use_gate = use_gate
-        # PyTorch MultiheadAttention expects [seq_len, batch, embed_dim] format 
+        # PyTorch MultiheadAttention expects [seq_len, batch, embed_dim] format
         self.cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=nhead, batch_first=False)
         
         if self.use_gate:
@@ -63,33 +63,34 @@ class GATAdapterLarge(nn.Module):
             self.convs.append(
                 GATConv(in_channels=input_dim, out_channels=hidden_dim, heads=num_heads, concat=False)
             )
-            # GraphNorm to stabilize gradients in deep GNNNs (different from BatchNorm - normalizes each graph individually)
+            # GraphNorm for stabilizing gradients in deep GNNs (different from BatchNorm - normalizes per graph)
             self.graphnorms.append(GraphNorm(hidden_dim))
-            # PReLU to avoid dying ReLU (learnable slope parameter)
+            # PReLU to avoid dying ReLU (learnable slope)
             self.prelus.append(nn.PReLU())
         
     def forward(self, x, edge_index, batch=None):
         """
-        Forward pass for deep GAT Adapter.
+        Forward pass for the deep GAT Adapter.
         
         Args:
-            x: Node features [num_all_nodes, 1024] (can be from a super graph containing multiple images)
+            x: Node features [num_all_nodes, 1024] (can come from a supergraph containing multiple images)
             edge_index: Edge index [2, num_edges]
-            batch: Tensor [num_all_nodes] indicating which node belongs to which image (e.g., [0,0,0,1,1,2,...])
-                   Required when processing non-uniform batches in PyG DataLoader.
-                   If None, assume x is from a single graph.
+            batch: Tensor [num_all_nodes] indicating which nodes belong to which image (e.g., [0,0,0,1,1,2,...])
+                   Required when processing heterogeneous batches in PyG DataLoader.
+                   If None, assume x comes from a single graph.
         
         Returns:
             x: Node features after GAT [num_all_nodes, 1024]
-               (NO pooling - keep each node individually so Decoder can map each node_index)
+               (NO pooling - keep each node separate so the Decoder can map each node_index)
         """
         for i, (conv, graphnorm, prelu) in enumerate(zip(self.convs, self.graphnorms, self.prelus)):
+            # Residual Projection: "highway" for gradients to early layers
             residual = x
             
             # GAT layer
             x = conv(x, edge_index)
             
-            # GraphNorm (normalize each graph individually, batch required)
+            # GraphNorm (normalize each graph separately, batch required)
             x = graphnorm(x, batch)
             
             # PReLU activation (learnable slope)
